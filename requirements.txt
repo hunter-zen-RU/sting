@@ -1,0 +1,5 @@
+# STING - WiFi Security Testing & Investigation Tool
+# Core dependencies
+
+scapy>=2.5.0
+requests>=2.25.0
