@@ -1,8 +1,11 @@
 # STING - Security Testing & Investigation of Networks & Gateways
 
-**Version 1.0.0 | Educational WiFi Security Tool**
+**Version 1.1.0 | Educational WiFi Security Tool**
 
-STING is a CLI-based WiFi deauthentication tool designed **exclusively for educational purposes**. It demonstrates how deauth attacks work, how modern security features (PMF/802.11w, WPA3) protect against them, and provides detailed educational content about 2026-era WiFi security standards.
+STING is a CLI-based WiFi security tool designed **exclusively for educational
+purposes**. It demonstrates how deauthentication attacks work, how modern
+security features (PMF/802.11w, WPA3) protect against them, and provides
+detailed educational content about 2026-era WiFi security standards.
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -24,6 +27,7 @@ STING is a CLI-based WiFi deauthentication tool designed **exclusively for educa
 Unauthorized use of deauthentication attacks is illegal in most jurisdictions.
 
 This tool is provided for:
+
 - Security researchers testing their own equipment
 - Students learning about WiFi security
 - Professionals conducting authorized penetration tests
@@ -31,166 +35,233 @@ This tool is provided for:
 
 ## Features
 
-### Core Functionality
-- **WiFi Network Scanner** - List nearby networks with SSID, BSSID, channel, signal strength, encryption type, and PMF status
-- **Deauthentication Attack** - Send 802.11 deauth frames to target networks (selectable by interactive scanning or direct BSSID)
-- **Continuous Loop** - Deauth runs in a loop until interrupted with Ctrl+C
-- **Verbose Mode** - Detailed packet structure and transmission information
+### Scanning
 
-### Educational Modules
-- **PMF (802.11w)** - Learn how Protected Management Frames block deauth attacks
-- **WPA3/SAE** - Understand Simultaneous Authentication of Equals
-- **Beacon Protection** - How beacon integrity prevents fake AP attacks
-- **OWE (Enhanced Open)** - Opportunistic Wireless Encryption for open networks
+- Detects nearby networks from beacon and probe-response frames
+- Displays SSID, BSSID, channel, signal strength, encryption, PMF and WPS
+- Correctly parses RSN/WPA information elements (WPA2, WPA3, WPA2/3 transition,
+  WPA2/3-Enterprise, OWE, WPA and WEP)
+- Detects PMF as **required**, **capable**, or not advertised
+- Optional channel hopping across 2.4 GHz, 5 GHz and 6 GHz
+- Automatic monitor-mode setup and restoration
+- Filtering by SSID, minimum signal, and hidden networks
+- Table, JSON and CSV output, including file export
+
+### Deauthentication (authorised testing only)
+
+- Sends 802.11 deauthentication frames to a selected network
+- Interactive scan-and-select workflow or direct `--bssid` mode
+- Configurable reason code, packet count, delay and channel
+- Optional time limit (`--duration`) and graceful Ctrl+C handling
+- **Dry-run mode** builds packets and reports statistics without transmitting
+- Detailed packet structure and attack statistics
+
+### Safety and maintenance
+
+- Automatic monitor-mode restoration on exit
+- SHA-256 verification of downloaded updates when GitHub provides a digest
+- Zip-slip protection and backup/rollback during self-update
+- Updates fall back to the newest git tag or the default branch when a
+  repository has no GitHub Releases
+- Input validation and clear error messages
+- Unit tests and GitHub Actions CI
+
+### Educational modules
+
+- **PMF (802.11w)** - how protected management frames block deauth attacks
+- **WPA3/SAE** - Simultaneous Authentication of Equals
+- **Beacon Protection** - beacon integrity and fake-AP prevention
+- **OWE (Enhanced Open)** - encryption for open networks
 - **6 GHz Band Security** - WiFi 6E/7 mandatory security requirements
-
-### Advanced Features
-- **Self-Update** - Check for and install updates from GitHub
-- **Interactive Selection** - Scan, choose a target, and attack in one workflow
-- **Direct Mode** - Target by BSSID without scanning (for scripting)
-- **Customizable** - Adjustable reason codes, packet count, delay, and channel
 
 ## Requirements
 
-- **OS**: Linux (primary), Windows/macOS (limited scanning support)
+- **OS**: Linux (primary); Windows/macOS have limited scanning support
 - **Python**: 3.8+
-- **Hardware**: WiFi adapter supporting monitor mode (for deauth attacks)
-- **Permissions**: Root/Administrator access required for raw packet injection
-
-### Dependencies
-- `scapy` - Packet crafting and injection
-- `requests` - Self-update functionality
+- **Hardware**: WiFi adapter supporting monitor mode and frame injection
+- **Permissions**: Root/Administrator access for raw packet injection
+- **Dependencies**: `scapy`, `requests`
 
 ## Installation
 
-### From Source
+### From source
 
 ```bash
-# Clone the repository
-git clone https://github.com/sting-wifi/sting.git
+git clone https://github.com/hunter-zen-RU/sting.git
 cd sting
-
-# Install dependencies
+python -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
-
-# Install STING
 pip install -e .
 ```
 
-### Direct Install
+### Run without installing
 
 ```bash
-# Install from local directory
-pip install -e /path/to/sting
-
-# Or run without installation
 cd /path/to/sting
 python -m sting
 ```
 
 ## Usage
 
-### Interactive Mode (Recommended)
-
-Simply run STING without arguments to enter interactive mode:
+### Interactive mode (recommended)
 
 ```bash
 sudo sting
 ```
 
 This will:
-1. Detect your wireless interface
-2. Scan for nearby networks (5 seconds)
-3. Display a table of found networks
-4. Prompt you to select a target by number
-5. Ask for confirmation before starting the attack
-6. Deauth continuously until Ctrl+C
 
-### Command-Line Options
+1. Detect your wireless interface
+2. Enable monitor mode if needed
+3. Scan for nearby networks
+4. Display a table of found networks
+5. Prompt you to select a target by number
+6. Ask for confirmation before starting
+7. Deauth continuously until Ctrl+C or `--duration` elapses
+
+### Command-line options
 
 ```
 usage: sting [-h] [-v] [-i INTERFACE] [-c CHANNEL] [-r REASON]
-             [-n COUNT] [-d DELAY] [-b BSSID] [-s STATION]
-             [--update] [--list-interfaces] [--no-banner]
+             [-n COUNT] [-d DELAY] [--duration DURATION] [-b BSSID]
+             [-s STATION] [--dry-run] [-y] [--scan] [--scan-time SCAN_TIME]
+             [--ssid SSID] [--min-signal MIN_SIGNAL] [--hide-hidden]
+             [--sort {signal,ssid,channel}] [--band {2.4,5,6,2.4+5,all}]
+             [--channels CHANNELS] [--dwell DWELL] [--no-hop]
+             [--format {table,json,csv}] [--output OUTPUT]
+             [--no-monitor] [--keep-monitor] [--update] [--check-updates]
+             [--list-interfaces] [--no-banner] [--version]
              [--learn-pmf] [--learn-wpa3] [--learn-beacon-protection]
              [--learn-owe] [--learn-6ghz] [--learn-all]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-v, --verbose` | Enable verbose output with packet details |
-| `-i, --interface` | Wireless interface (e.g., wlan0) |
-| `-c, --channel` | Channel to operate on |
-| `-r, --reason` | Deauth reason code (1-10, default: 7) |
-| `-n, --count` | Packets per cycle (default: 3) |
+| `-v, --verbose` | Verbose output with packet details |
+| `-i, --interface` | Wireless interface (e.g. `wlan0`) |
+| `-c, --channel` | Channel to operate on (also restricts the scan to it) |
+| `-r, --reason` | Deauth reason code (default: 7) |
+| `-n, --count` | Frames per cycle (default: 3) |
 | `-d, --delay` | Delay between cycles in seconds (default: 0.1) |
-| `-b, --bssid` | Target AP BSSID (skips interactive scan) |
+| `--duration` | Stop the attack after this many seconds |
+| `-b, --bssid` | Target AP BSSID (skips interactive selection) |
 | `-s, --station` | Target station MAC (default: broadcast) |
-| `--update` | Check and apply updates from GitHub |
-| `--list-interfaces` | List available wireless interfaces |
+| `--dry-run` | Build packets and report statistics without sending |
+| `-y, --yes` | Skip the interactive confirmation prompt |
+| `--scan` | Scan and print results, then exit |
+| `--scan-time` | Total scan duration in seconds (default: 10) |
+| `--ssid` | Only show SSIDs containing this text |
+| `--min-signal` | Only show networks at or above this dBm value |
+| `--hide-hidden` | Hide networks with an empty/hidden SSID |
+| `--sort` | Sort by `signal`, `ssid` or `channel` (default: `signal`) |
+| `--band` | Bands to hop: `2.4`, `5`, `6`, `2.4+5`, `all` (default: `2.4+5`) |
+| `--channels` | Explicit channel list, e.g. `1-11,36,149` |
+| `--dwell` | Seconds per channel while hopping (default: 0.25) |
+| `--no-hop` | Do not hop between channels |
+| `--format` | Scan output: `table`, `json`, or `csv` (default: `table`) |
+| `--output` | Write scan results to a file |
+| `--no-monitor` | Do not enable monitor mode automatically |
+| `--keep-monitor` | Leave the interface in monitor mode on exit |
+| `--update` | Check for and install updates from GitHub |
+| `--check-updates` | Check only; exits `2` when an update is available |
+| `--list-interfaces` | List wireless interfaces and their mode |
 | `--no-banner` | Suppress startup banner |
+| `--version` | Show version and repository URL |
 | `--learn-pmf` | Learn about PMF (802.11w) |
 | `--learn-wpa3` | Learn about WPA3/SAE |
-| `--learn-beacon-protection` | Learn about Beacon Protection |
+| `--learn-beacon-protection` | Learn about beacon protection |
 | `--learn-owe` | Learn about OWE |
 | `--learn-6ghz` | Learn about 6 GHz security |
 | `--learn-all` | Display all educational content |
 
-### Examples
+## Examples
 
 ```bash
 # Interactive scan and deauth
 sudo sting
 
-# Verbose mode (see packet details)
-sudo sting -v
+# Non-interactive scan (never transmits deauth frames)
+sudo sting --scan
 
-# Direct attack on a specific AP (requires channel)
+# Scan only 5 GHz, filter by SSID, export as JSON
+sudo sting --scan --band 5 --ssid office --format json --output scan.json
+
+# Scan selected channels only
+sudo sting --scan --channels 1-11,36,149
+
+# Verbose scan with per-network details
+sudo sting --scan -v
+
+# Direct attack on a specific AP
 sudo sting -b AA:BB:CC:DD:EE:FF -c 6
 
 # Target a specific client instead of broadcast
 sudo sting -b AA:BB:CC:DD:EE:FF -c 6 -s 11:22:33:44:55:66
 
-# Use reason code 1 (unspecified)
-sudo sting -r 1
+# Send 10 frames per cycle with 0.5s delay for 30 seconds
+sudo sting -b AA:BB:CC:DD:EE:FF -c 6 -n 10 -d 0.5 --duration 30
 
-# Send 10 packets per cycle with 0.5s delay
-sudo sting -n 10 -d 0.5
+# Demonstrate packet building without transmitting anything
+sudo sting -b AA:BB:CC:DD:EE:FF -c 6 --dry-run
 
-# List interfaces without scanning
+# List interfaces and modes
 sting --list-interfaces
 
-# Check for updates
-sting --update
+# Update check
+sting --check-updates
+sudo sting --update
 
 # Learn about WiFi security features
 sting --learn-all
 sting --learn-pmf
-sting --learn-wpa3
 ```
 
-## Understanding Deauth Attacks
+## How scanning works
 
-### How It Works
+STING first tries to enable monitor mode using `iw`. It then captures beacon and
+probe-response frames with Scapy while optionally hopping across the selected
+channels. When Scapy is unavailable, it falls back to `iw dev <iface> scan`
+(Linux) or `netsh wlan show networks` (Windows).
 
-1. **Packet Crafting**: STING constructs a raw 802.11 deauthentication frame:
-   - `RadioTap` - Radio metadata header
+Channel hopping needs an interface in monitor mode. If monitor mode cannot be
+enabled, STING continues scanning on the interface's current channel. Use
+`--no-monitor` if you manage monitor mode yourself, or `--keep-monitor` to leave
+it enabled when STING exits.
+
+The **PMF** column shows:
+
+| Label | Meaning |
+|-------|---------|
+| `REQ` | PMF required - unencrypted deauth frames are ignored |
+| `CAP` | PMF capable - PMF clients ignore forged deauth frames |
+| `NO` | PMF not advertised - legacy behaviour |
+
+The **WPS** column shows `YES` when a WPS information element is present.
+
+## Understanding deauthentication attacks
+
+### How it works
+
+1. **Packet crafting**: STING constructs a raw 802.11 deauthentication frame:
+   - `RadioTap` - radio metadata header
    - `Dot11` - MAC header (type=management, subtype=deauth)
-   - `Dot11Deauth` - Frame body with reason code
+   - `Dot11Deauth` - frame body with a reason code
+2. **Transmission**: frames are sent at layer 2 through a monitor-mode interface
+3. **Effect**: clients receiving a valid deauth frame disconnect from the AP
 
-2. **Transmission**: Packets are sent at layer 2 using the wireless interface in monitor mode
-
-3. **Effect**: Clients receiving a valid deauth frame immediately disconnect from the AP
-
-### Why PMF Blocks This
+### Why PMF blocks this
 
 PMF (802.11w / Protected Management Frames) requires management frames to be:
+
 - **Encrypted** using CCMP (AES) with the Pairwise Transient Key (PTK)
 - **Authenticated** using BIP-CMAC with the Integrity GTK (IGTK)
 
-Without the PTK (which requires the WiFi password), an attacker cannot forge valid deauth frames. The AP and PMF-capable clients simply ignore unencrypted deauth frames.
+Without the PTK (which requires the WiFi password), an attacker cannot forge
+valid deauth frames. PMF-capable APs and clients ignore unencrypted deauth
+frames.
 
-### Reason Codes
+### Reason codes
 
 | Code | Meaning |
 |------|---------|
@@ -204,52 +275,85 @@ Without the PTK (which requires the WiFi password), an attacker cannot forge val
 | 7 | Class 3 frame from nonassociated station |
 | 8 | Station leaving BSS |
 
+Additional reason codes (including WPA3/SAE failures) are listed in
+`sting/__init__.py`.
+
 ## 2026 Security Landscape
 
-STING educates on these modern WiFi security features:
-
 ### Protected Management Frames (802.11w)
-- Encrypts deauth, disassoc, beacon, and probe frames
+
+- Protects deauth, disassoc, and other management frames
 - **Mandatory** for WPA3 and all 6 GHz operation
 - Renders traditional deauth attacks ineffective
+- RSN capabilities use bit 6 (`0x0040`) for *required* and bit 7 (`0x0080`)
+  for *capable*
 
 ### WPA3/SAE
-- Dragonfly handshake replaces 4-way handshake
-- Forward secrecy - captured handshakes can't be decrypted later
-- Dictionary attack resistant - no offline brute force
+
+- Dragonfly handshake replaces the WPA2 4-way handshake
+- Forward secrecy - captured sessions cannot be decrypted later
+- Dictionary-attack resistant - no offline brute force
 - PMF is mandatory
 
 ### Beacon Protection
-- Broadcase Integrity Protocol (BIP) protects beacon frames
+
+- Broadcast Integrity Protocol (BIP) protects beacon frames
 - Prevents fake AP and downgrade attacks
 - Required for WiFi 7 certification
 
 ### OWE (Enhanced Open)
+
 - Diffie-Hellman key exchange for open networks
 - Encrypts traffic without a password
 - No authentication - still vulnerable to active MITM
 
 ### 6 GHz Band
+
 - WPA3 only (no WPA2 fallback)
 - PMF always enabled
-- Deauth attacks impossible by design
+- Deauth attacks are impossible by design
 
 ## Architecture
 
 ```
 sting/
-├── README.md               # This file
-├── setup.py                # Package installer
-├── requirements.txt        # Python dependencies
-├── sting/                  # Main package
-│   ├── __init__.py         # Package metadata, constants, reason codes
-│   ├── __main__.py         # python -m sting entry point
-│   ├── cli.py              # CLI orchestration and argument parsing
-│   ├── scanner.py          # WiFi network scanning (scapy + system fallback)
-│   ├── deauth.py           # Deauth packet crafting and transmission
-│   ├── updater.py          # GitHub self-update mechanism
-│   └── security_features.py # Educational content modules
+├── README.md                 # This file
+├── setup.py                  # Package metadata and entry point
+├── pyproject.toml            # Build system and pytest configuration
+├── setup.cfg                 # Flake8 configuration
+├── requirements.txt          # Runtime dependencies
+├── sting/                    # Main package
+│   ├── __init__.py           # Metadata, banner and reason codes
+│   ├── __main__.py           # python -m sting entry point
+│   ├── cli.py                # Argument parsing, workflows, output formats
+│   ├── ieee80211.py          # Pure 802.11 parsing (RSN/WPA/channels/MACs)
+│   ├── system.py             # Interface discovery, monitor mode, channels
+│   ├── scanner.py            # Scapy scanner + iw/netsh fallback
+│   ├── deauth.py             # Packet building, transmission, statistics
+│   ├── updater.py            # GitHub self-update with integrity checks
+│   └── security_features.py  # Educational content modules
+├── tests/                    # Unit tests (unittest / pytest compatible)
+└── .github/workflows/ci.yml  # GitHub Actions CI
 ```
+
+## Development
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pip install -e ".[test]"
+
+# Run tests
+python -m pytest
+
+# Lint
+flake8 sting tests
+```
+
+The test suite covers RSN/WPA parsing, PMF detection, channel mapping, scan
+output parsers, CLI filtering/output, updater version comparison, safe zip
+extraction, and deauth dry-run statistics.
 
 ## Contributing
 
@@ -261,7 +365,7 @@ sting/
 
 ## License
 
-MIT License - See LICENSE file for details.
+MIT License - see the `LICENSE` file for details.
 
 ## Disclaimer
 

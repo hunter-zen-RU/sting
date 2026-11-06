@@ -110,8 +110,8 @@ def print_pmf_education():
     print("  To test if a network has PMF enabled:")
     print("    1. Use STING to scan - PMF column shows YES/NO")
     print("    2. Look for RSN capabilities in beacon frames:")
-    print("       - Bit 6 (0x20) = MFP Capable")
-    print("       - Bit 7 (0x40) = MFP Required")
+    print("       - Bit 6 (0x0040) = MFP Required")
+    print("       - Bit 7 (0x0080) = MFP Capable")
     print("    3. Try a deauth attack - if it fails, PMF is likely active")
     print("    4. For educational demos, use legacy APs or disable PMF")
     print()
@@ -130,7 +130,7 @@ def print_wpa3_education():
 
     _print_subsection("Key Improvements over WPA2")
     print("  1. SAE Handshake: Replaces the 4-way handshake with a password-")
-    print("     authenticated key exchange based on Dragonfly (RFC 7664 / RFC 5931)")
+    print("     authenticated key exchange based on Dragonfly (RFC 7664)")
     print()
     print("  2. Forward Secrecy: Even if the password is later compromised,")
     print("     previously recorded sessions cannot be decrypted.")
@@ -192,7 +192,7 @@ def print_wpa3_education():
 
     _print_subsection("Penetration Testing Relevance")
     print("  - WPA3 handshake capture is still possible (for PMKID)")
-    print("  - Offline password cracking is INFEAISIBLE (SAE is immune)")
+    print("  - Offline password cracking is INFEASIBLE (SAE is immune)")
     print("  - Downgrade attacks target WPA3-Transition mode")
     print("  - PMKID capture works on some WPA3 implementations (weak)")
     print("  - Deauth attacks on WPA3 are BLOCKED by PMF")
@@ -316,3 +316,12 @@ def print_6ghz_education():
     print("  - Security testing tools are still evolving for 6 GHz")
     print("  - Software-defined radio (SDR) approaches are emerging")
     print()
+
+
+def print_all_education():
+    """Display every educational module in a single run."""
+    print_pmf_education()
+    print_wpa3_education()
+    print_beacon_protection_education()
+    print_owe_education()
+    print_6ghz_education()

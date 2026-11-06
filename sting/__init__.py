@@ -7,11 +7,11 @@ and understand modern WiFi security mechanisms.
 """
 
 __title__ = "STING"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "STING Open Source Contributors"
 __license__ = "MIT"
 __description__ = "WiFi Security Testing & Education Tool"
-__github_url__ = "https://github.com/sting-wifi/sting"
+__github_url__ = "https://github.com/hunter-zen-RU/sting"
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════════════════╗

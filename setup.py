@@ -1,8 +1,12 @@
 """Setup script for STING - WiFi Security Testing & Investigation Tool."""
 
-from setuptools import setup, find_packages
+from pathlib import Path
+
+from setuptools import find_packages, setup
 
 import sting
+
+README = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
 
 setup(
     name="sting-wifi",
@@ -10,16 +14,23 @@ setup(
     author=sting.__author__,
     license=sting.__license__,
     description=sting.__description__,
-    long_description=open("README.md", encoding="utf-8").read(),
+    long_description=README,
     long_description_content_type="text/markdown",
     url=sting.__github_url__,
-    packages=find_packages(),
+    project_urls={
+        "Source": sting.__github_url__,
+        "Issues": f"{sting.__github_url__}/issues",
+    },
+    packages=find_packages(exclude=("tests", "tests.*")),
     include_package_data=True,
     python_requires=">=3.8",
     install_requires=[
         "scapy>=2.5.0",
         "requests>=2.25.0",
     ],
+    extras_require={
+        "test": ["pytest>=7"],
+    },
     entry_points={
         "console_scripts": [
             "sting=sting.cli:main",

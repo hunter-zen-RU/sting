@@ -1,486 +1,556 @@
-"""
-WiFi Network Scanner Module
+"""WiFi network scanner.
 
-Scans for wireless networks by sniffing beacon and probe response frames.
-Detects SSID, BSSID, channel, signal strength, encryption type, and PMF status.
+Captures beacon and probe-response frames with Scapy and extracts SSID,
+BSSID, channel, signal strength, encryption type, PMF and WPS information.
+When Scapy is unavailable, falls back to ``iw``/``netsh``.
 """
 
-import os
+import importlib.util
 import re
 import subprocess
 import sys
+import threading
 import time
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
-# Scapy imports with fallback
-try:
-    from scapy.all import sniff, Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, RadioTap
-    from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, RadioTap
-    HAVE_SCAPY = True
-except ImportError:
-    HAVE_SCAPY = False
+from sting.ieee80211 import (
+    channel_from_frequency,
+    classify_security,
+    parse_rsn_ie,
+    parse_wpa_ie,
+)
+from sting.system import get_interface_mode, get_wireless_interfaces, set_channel
 
+# Scapy is imported lazily so commands that do not capture packets (version,
+# help, education, interface listing) start quickly and quietly.
+HAVE_SCAPY = importlib.util.find_spec("scapy") is not None
 
-def get_wireless_interfaces() -> List[str]:
-    """
-    Detect available wireless interfaces on the system.
-    Supports Linux (iwconfig/iw), Windows (netsh), and macOS (networksetup).
-    """
-    interfaces = []
-
-    if sys.platform.startswith("linux"):
-        # Linux: use iwconfig or iw
-        try:
-            result = subprocess.run(
-                ["iwconfig"], capture_output=True, text=True, timeout=5
-            )
-            for line in result.stdout.split("\n"):
-                if "IEEE 802.11" in line:
-                    iface = line.split()[0]
-                    if iface:
-                        interfaces.append(iface)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Fallback: list wireless interfaces via iw dev
-        if not interfaces:
-            try:
-                result = subprocess.run(
-                    ["iw", "dev"], capture_output=True, text=True, timeout=5
-                )
-                for line in result.stdout.split("\n"):
-                    if "Interface" in line:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            interfaces.append(parts[-1])
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-
-        # Last resort: list all 'wl' prefixed interfaces from /sys
-        if not interfaces:
-            try:
-                for entry in os.listdir("/sys/class/net"):
-                    if entry.startswith("wl"):
-                        interfaces.append(entry)
-            except FileNotFoundError:
-                pass
-
-    elif sys.platform == "win32":
-        # Windows: use netsh wlan
-        try:
-            result = subprocess.run(
-                ["netsh", "wlan", "show", "interfaces"],
-                capture_output=True, text=True, timeout=10
-            )
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("Name"):
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        iface_name = parts[1].strip()
-                        interfaces.append(iface_name)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-    elif sys.platform == "darwin":
-        # macOS
-        try:
-            result = subprocess.run(
-                ["networksetup", "-listallhardwareports"],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = result.stdout.split("\n")
-            capture_next = False
-            for line in lines:
-                if "Wi-Fi" in line or "AirPort" in line:
-                    capture_next = True
-                elif capture_next and "Device" in line:
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        interfaces.append(parts[1].strip())
-                    capture_next = False
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-    return interfaces
+Dot11 = Dot11Beacon = Dot11Elt = Dot11ProbeResp = RadioTap = sniff = None
 
 
-def enable_monitor_mode(interface: str) -> bool:
-    """Attempt to enable monitor mode on the interface (Linux only)."""
-    if not sys.platform.startswith("linux"):
-        print("[!] Monitor mode is only supported on Linux.")
-        print("    On Windows/macOS, use managed-mode scanning (limited).")
-        return False
-
-    try:
-        # Bring interface down
-        subprocess.run(["ip", "link", "set", interface, "down"],
-                       capture_output=True, timeout=5)
-        # Set monitor mode
-        subprocess.run(["iw", "dev", interface, "set", "type", "monitor"],
-                       capture_output=True, timeout=5)
-        # Bring interface up
-        subprocess.run(["ip", "link", "set", interface, "up"],
-                       capture_output=True, timeout=5)
+def _load_scapy() -> bool:
+    """Import Scapy on first use. Returns True when it is available."""
+    global Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, RadioTap, sniff
+    if sniff is not None:
         return True
-    except Exception as e:
-        print(f"[VERBOSE] Failed to set monitor mode: {e}")
+    if not HAVE_SCAPY:
         return False
-
-
-def disable_monitor_mode(interface: str):
-    """Restore managed mode on the interface."""
-    if not sys.platform.startswith("linux"):
-        return
     try:
-        subprocess.run(["ip", "link", "set", interface, "down"],
-                       capture_output=True, timeout=5)
-        subprocess.run(["iw", "dev", interface, "set", "type", "managed"],
-                       capture_output=True, timeout=5)
-        subprocess.run(["ip", "link", "set", interface, "up"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+        from scapy.all import (
+            Dot11 as scapy_dot11,
+            Dot11Beacon as scapy_beacon,
+            Dot11Elt as scapy_elt,
+            Dot11ProbeResp as scapy_probe_resp,
+            RadioTap as scapy_radiotap,
+            sniff as scapy_sniff,
+        )
+    except ImportError:
+        return False
+    Dot11 = scapy_dot11
+    Dot11Beacon = scapy_beacon
+    Dot11Elt = scapy_elt
+    Dot11ProbeResp = scapy_probe_resp
+    RadioTap = scapy_radiotap
+    sniff = scapy_sniff
+    return True
 
 
-def parse_encryption_from_capabilities(cap: str, rsn_ie: bool = False) -> str:
-    """
-    Determine encryption type from capabilities and RSN information.
-    Returns a short string like 'WPA2', 'WPA3', 'WPA2/3', 'OPEN', 'WEP'.
-    """
-    if rsn_ie:
-        # Check for WPA3/SAE capabilities in RSN
-        if "SAE" in cap or "00-0F-AC:8" in cap:
-            return "WPA3"
-        if "00-0F-AC:4" in cap:  # CCMP
-            return "WPA2"
-        return "WPA2"
-    if "WPA" in cap:
-        return "WPA"
-    if "WEP" in cap:
-        return "WEP"
-    return "OPEN"
+# Re-exported for backwards compatibility.
+__all__ = [
+    "HAVE_SCAPY",
+    "get_wireless_interfaces",
+    "scan_networks",
+    "scan_networks_system",
+]
 
 
-def scan_networks(interface: str, scan_time: int = 5,
-                  verbose: bool = False) -> List[Dict]:
-    """
-    Scan for WiFi networks by sniffing beacon frames.
-    Returns a list of dicts with network information.
+# ---------------------------------------------------------------------------
+# Scapy helpers
+# ---------------------------------------------------------------------------
 
-    Uses scapy for packet capture. Falls back to system commands if scapy
-    is unavailable.
+def _as_bytes(value) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, str):
+        return value.encode("latin-1", errors="replace")
+    try:
+        return bytes(value)
+    except (TypeError, ValueError):
+        return b""
+
+
+def _extract_frequency(pkt) -> Optional[int]:
+    if RadioTap is None or not pkt.haslayer(RadioTap):
+        return None
+    radiotap = pkt.getlayer(RadioTap)
+    frequency = getattr(radiotap, "ChannelFrequency", None)
+    if frequency is None:
+        return None
+    try:
+        frequency = int(frequency)
+    except (TypeError, ValueError):
+        return None
+    return frequency if 2400 <= frequency <= 7125 else None
+
+
+def _extract_signal(pkt) -> int:
+    if RadioTap is None or not pkt.haslayer(RadioTap):
+        return -100
+    radiotap = pkt.getlayer(RadioTap)
+    value = getattr(radiotap, "dBm_AntSignal", None)
+    if value is None:
+        value = getattr(radiotap, "AntennaSignal", None)
+    if value is None:
+        return -100
+    try:
+        signal = int(value)
+    except (TypeError, ValueError):
+        return -100
+    # Raw radiotap antenna signal is an unsigned byte.
+    if signal > 127:
+        signal -= 256
+    return max(-128, min(127, signal))
+
+
+def _capability_field(pkt) -> int:
+    layer = None
+    if Dot11Beacon is not None and pkt.haslayer(Dot11Beacon):
+        layer = pkt.getlayer(Dot11Beacon)
+    elif Dot11ProbeResp is not None and pkt.haslayer(Dot11ProbeResp):
+        layer = pkt.getlayer(Dot11ProbeResp)
+    if layer is None:
+        return 0
+    try:
+        return int(getattr(layer, "cap", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _iter_elements(pkt):
+    element = pkt.getlayer(Dot11Elt)
+    while element is not None:
+        yield element
+        payload = element.payload
+        element = payload.getlayer(Dot11Elt) if hasattr(payload, "getlayer") else None
+
+
+def _process_packet(pkt, networks: Dict[str, Dict], verbose: bool,
+                    include_hidden: bool) -> None:
+    if Dot11 is None or not pkt.haslayer(Dot11):
+        return
+    if not (pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)):
+        return
+
+    bssid = getattr(pkt, "addr2", None)
+    if not bssid:
+        return
+    bssid = str(bssid).lower()
+
+    ssid = ""
+    ds_channel = 0
+    rsn_bytes = b""
+    wpa_bytes = b""
+    wps = False
+
+    for element in _iter_elements(pkt):
+        element_id = getattr(element, "ID", None)
+        info = _as_bytes(getattr(element, "info", b""))
+        if element_id == 0:  # SSID
+            ssid = info.decode("utf-8", errors="replace").rstrip("\x00")
+        elif element_id == 3:  # DS Parameter Set
+            if info:
+                ds_channel = info[0]
+        elif element_id == 48:  # RSN
+            rsn_bytes = info
+        elif element_id == 221:  # Vendor specific
+            if info[:4] == b"\x00\x50\xf2\x01":
+                wpa_bytes = info
+            elif info[:4] == b"\x00\x50\xf2\x04":
+                wps = True
+
+    hidden = not ssid
+    if hidden and not include_hidden:
+        return
+
+    frequency = _extract_frequency(pkt)
+    channel = ds_channel or channel_from_frequency(frequency)
+    signal = _extract_signal(pkt)
+    privacy = bool(_capability_field(pkt) & 0x0010)
+
+    rsn = parse_rsn_ie(rsn_bytes) if rsn_bytes else None
+    wpa = parse_wpa_ie(wpa_bytes) if wpa_bytes else None
+    encryption = classify_security(rsn, wpa, privacy)
+
+    entry = {
+        "ssid": ssid or "<hidden>",
+        "hidden": hidden,
+        "bssid": bssid,
+        "channel": int(channel or 0),
+        "frequency": int(frequency or 0),
+        "signal": signal,
+        "encryption": encryption,
+        "pmf": bool(rsn and rsn.get("pmf")),
+        "pmf_required": bool(rsn and rsn.get("pmf_required")),
+        "pmf_capable": bool(rsn and rsn.get("pmf_capable")),
+        "wps": wps,
+        "last_seen": time.time(),
+    }
+
+    if verbose:
+        print(
+            f"[VERBOSE] {entry['ssid']} ({entry['bssid']}) "
+            f"CH:{entry['channel']} SIG:{entry['signal']}dBm "
+            f"ENCR:{entry['encryption']} PMF:{entry['pmf']} WPS:{entry['wps']}"
+        )
+
+    existing = networks.get(bssid)
+    if existing is not None and existing.get("signal", -100) >= signal:
+        return
+    networks[bssid] = entry
+
+
+def _hop_channels(interface: str, channels: List[int], dwell: float,
+                  stop_event: threading.Event, verbose: bool) -> None:
+    """Background thread that cycles through channels while sniffing."""
+    index = 0
+    failures = 0
+    while not stop_event.is_set():
+        channel = channels[index % len(channels)]
+        index += 1
+        if set_channel(interface, channel):
+            failures = 0
+        else:
+            failures += 1
+            if failures >= min(3, len(channels)):
+                if verbose:
+                    print("[VERBOSE] Channel hopping disabled "
+                          "(could not tune the interface).")
+                return
+        if stop_event.wait(dwell):
+            return
+
+
+def _start_hopping(interface: str, channels: Optional[List[int]], dwell: float,
+                   verbose: bool):
+    """Start channel hopping when the interface supports it."""
+    if not channels or len(channels) <= 1:
+        return None, None
+
+    mode = get_interface_mode(interface)
+    if mode not in (None, "monitor"):
+        if verbose:
+            print(f"[VERBOSE] Not hopping: interface {interface} is in {mode} mode.")
+        return None, None
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_hop_channels,
+        args=(interface, channels, max(0.05, dwell), stop_event, verbose),
+        daemon=True,
+        name="sting-channel-hop",
+    )
+    thread.start()
+    return thread, stop_event
+
+
+def _stop_hopping(thread, stop_event) -> None:
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None:
+        thread.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Public scan API
+# ---------------------------------------------------------------------------
+
+def scan_networks(interface: str, scan_time: float = 10, verbose: bool = False,
+                  channels: Optional[List[int]] = None, dwell: float = 0.25,
+                  hop: bool = True, include_hidden: bool = True) -> List[Dict]:
+    """Scan for WiFi networks.
+
+    Args:
+        interface: Wireless interface name.
+        scan_time: Total capture time in seconds.
+        verbose: Print per-network details.
+        channels: Optional channel list used for hopping.
+        dwell: Seconds to spend on each channel.
+        hop: Set to False to disable channel hopping.
+        include_hidden: Include networks with a hidden/empty SSID.
     """
     if not HAVE_SCAPY:
         print("[!] Scapy not installed. Falling back to system command scanning.")
-        return scan_networks_system(interface, scan_time, verbose)
+        return scan_networks_system(interface, scan_time, verbose,
+                                    include_hidden=include_hidden)
+    if not _load_scapy():
+        print("[!] Scapy could not be imported. Falling back to system scanning.")
+        return scan_networks_system(interface, scan_time, verbose,
+                                    include_hidden=include_hidden)
 
     networks: Dict[str, Dict] = {}
-    start_time = time.time()
+    thread = None
+    stop_event = None
+    if hop:
+        thread, stop_event = _start_hopping(interface, channels, dwell, verbose)
 
-    def packet_handler(pkt):
-        """Process each captured packet."""
-        nonlocal start_time
+    print(f"[*] Sniffing on {interface} for {scan_time:g} seconds...")
 
-        # Check if we have a Dot11 layer
-        if not pkt.haslayer(Dot11):
-            return
+    sniff_kwargs = dict(iface=interface, prn=lambda pkt: _process_packet(
+        pkt, networks, verbose, include_hidden), store=0, timeout=scan_time)
 
-        # Look for Beacon or Probe Response frames
-        is_beacon = pkt.haslayer(Dot11Beacon)
-        is_probe_resp = pkt.haslayer(Dot11ProbeResp)
-
-        if not (is_beacon or is_probe_resp):
-            return
-
-        # Extract BSSID (source MAC)
-        bssid = pkt.addr2
-        if not bssid:
-            return
-
-        # Extract SSID from Dot11Elt
-        ssid = ""
-        channel = None
-        rsn_present = False
-        rsn_capabilities = ""
-
-        elt = pkt.getlayer(Dot11Elt)
-        while elt:
-            if elt.ID == 0:  # SSID
-                try:
-                    ssid = elt.info.decode("utf-8", errors="replace")
-                except Exception:
-                    ssid = "<non-printable>"
-            elif elt.ID == 3:  # Channel (DS Parameter Set)
-                if len(elt.info) > 0:
-                    channel = int.from_bytes(elt.info[:1], "little")
-
-            elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt.payload, 'getlayer') else None
-
-        # Skip hidden SSID probes
-        if not ssid or ssid == "":
-            return
-
-        # Get signal strength from RadioTap
-        signal = -100
-        if pkt.haslayer(RadioTap):
-            try:
-                rt = pkt.getlayer(RadioTap)
-                if hasattr(rt, 'dBm_AntSignal') and rt.dBm_AntSignal is not None:
-                    signal = int(rt.dBm_AntSignal)
-                elif hasattr(rt, 'AntennaSignal') and rt.AntennaSignal is not None:
-                    signal = int(rt.AntennaSignal) - 256 if int(rt.AntennaSignal) > 128 else int(rt.AntennaSignal)
-            except (ValueError, TypeError):
-                pass
-
-        # Detect encryption and PMF from RSN element
-        encryption = "?"
-        pmf = False
-
-        # Check RSN IE and Vendor-specific IEs
-        elt = pkt.getlayer(Dot11Elt)
-        while elt:
-            # RSN Information Element (ID=48)
-            if elt.ID == 48:
-                rsn_present = True
-                info = elt.info.hex() if hasattr(elt.info, 'hex') else ''
-                # RSN capabilities: bytes after pairwise/group cipher suites
-                # Typically at offset depends on auth key management count
-                # PMF is indicated by RSN capabilities bit 7 (Management Frame Protection Required)
-                # and bit 6 (Management Frame Protection Capable)
-
-                if len(elt.info) >= 8:
-                    # RSN capabilities are at variable offsets; simplest detection:
-                    rsn_bytes = bytes(elt.info)
-                    if len(rsn_bytes) > 6:
-                        # AKM count at offset 4 * (group_cipher_count = 1) + 4 = 8
-                        # Actually parse properly:
-                        try:
-                            # Group cipher suite: 4 bytes for OUI + 1 byte type = starting at offset 2
-                            gc_count = int.from_bytes(rsn_bytes[2:4], 'little')
-                            pairwise_offset = 4 + gc_count * 4
-                            pw_count = int.from_bytes(rsn_bytes[pairwise_offset:pairwise_offset + 2], 'little')
-                            akm_offset = pairwise_offset + 2 + pw_count * 4
-                            ak_count = int.from_bytes(rsn_bytes[akm_offset:akm_offset + 2], 'little')
-                            rsn_cap_offset = akm_offset + 2 + ak_count * 4
-
-                            if len(rsn_bytes) >= rsn_cap_offset + 2:
-                                rsn_cap = int.from_bytes(rsn_bytes[rsn_cap_offset:rsn_cap_offset + 2], 'little')
-                                # Bit 7 (0x40) = MFP Required
-                                # Bit 6 (0x20) = MFP Capable
-                                pmf = bool(rsn_cap & 0x60)
-                        except Exception:
-                            pass
-
-                    # Detect WPA3 via AKM suite type 8 (SAE)
-                    if b'\x00\x0f\xac\x08' in rsn_bytes:
-                        encryption = "WPA3"
-                    elif b'\x00\x0f\xac\x04' in rsn_bytes:
-                        encryption = "WPA2"
-                    elif b'\x00\x0f\xac\x01' in rsn_bytes:
-                        encryption = "WPA"
-                    elif b'\x00\x0f\xac\x02' in rsn_bytes:
-                        encryption = "WPA"
-
-            # WPA IE (Vendor-specific with WPA OUI)
-            if elt.ID == 221 and hasattr(elt, 'info'):
-                info = bytes(elt.info) if hasattr(elt.info, '__iter__') else b''
-                if info[:4] == b'\x00P\xf2\x01':  # Microsoft WPA OUI
-                    if encryption == "?":
-                        encryption = "WPA"
-
-            elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt.payload, 'getlayer') else None
-
-        if encryption == "?":
-            encryption = "OPEN"
-
-        if verbose:
-            print(f"[VERBOSE] Found network: {ssid} ({bssid}) CH:{channel} "
-                  f"SIG:{signal}dBm ENCR:{encryption} PMF:{pmf}")
-
-        # Store or update network info (keep best signal)
-        if bssid not in networks or signal > networks[bssid].get("signal", -100):
-            networks[bssid] = {
-                "ssid": ssid,
-                "bssid": bssid,
-                "channel": channel or 0,
-                "signal": signal,
-                "encryption": encryption,
-                "pmf": pmf,
-            }
-
-    # Start sniffing
-    print(f"[*] Sniffing on {interface} for {scan_time} seconds...")
     try:
-        sniff(
-            iface=interface,
-            prn=packet_handler,
-            store=0,
-            timeout=scan_time,
-            monitor=True,
-        )
+        try:
+            sniff(monitor=False, **sniff_kwargs)
+        except TypeError:
+            # Older Scapy versions do not accept the ``monitor`` kwarg.
+            sniff(**sniff_kwargs)
     except PermissionError:
         print("[!] Permission denied. Run as root/administrator.")
         return []
-    except Exception as e:
-        print(f"[!] Error during sniffing: {e}")
+    except OSError as exc:
+        print(f"[!] Could not capture on {interface}: {exc}")
+        return []
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(f"[!] Error during sniffing: {exc}")
         if verbose:
             import traceback
             traceback.print_exc()
         return []
+    finally:
+        _stop_hopping(thread, stop_event)
 
     if verbose:
         print(f"[VERBOSE] Scan completed. Found {len(networks)} unique networks.")
 
-    # Sort by signal strength (descending)
-    result = sorted(networks.values(), key=lambda n: n.get("signal", -100), reverse=True)
-    return result
+    return sorted(networks.values(), key=lambda net: net.get("signal", -100),
+                  reverse=True)
 
 
-def scan_networks_system(interface: str, scan_time: int = 5,
-                          verbose: bool = False) -> List[Dict]:
-    """
-    Fallback scanner using system commands (iw dev scan on Linux,
-    netsh wlan show networks on Windows).
-    """
-    networks = []
+# ---------------------------------------------------------------------------
+# System-command fallback
+# ---------------------------------------------------------------------------
 
+def _parse_iw_scan_output(output: str, include_hidden: bool) -> List[Dict]:
+    networks: Dict[str, Dict] = {}
+    blocks = re.split(r"(?m)^BSS\s+", output)
+
+    for block in blocks[1:]:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        bssid = lines[0].strip().split("(")[0].strip().lower()
+        if not bssid:
+            continue
+
+        ssid = ""
+        frequency = 0
+        signal = -100
+        channel = 0
+        privacy = False
+        wps = False
+        rsn_present = False
+        wpa_present = False
+        in_rsn = False
+        akms: List[str] = []
+        capabilities = 0
+
+        for raw_line in lines[1:]:
+            line = raw_line.strip()
+            if line.startswith("* "):
+                line = line[2:].strip()
+
+            if line.startswith("SSID:"):
+                ssid = line.split(":", 1)[1].strip()
+            elif line.startswith("freq:"):
+                try:
+                    frequency = int(float(line.split(":", 1)[1].strip()))
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("signal:"):
+                try:
+                    signal = int(float(line.split(":", 1)[1].strip().split()[0]))
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("capability:"):
+                privacy = "Privacy" in line
+            elif line.startswith("DS Parameter set:"):
+                match = re.search(r"channel\s+(\d+)", line)
+                if match:
+                    channel = int(match.group(1))
+            elif line.startswith("RSN:"):
+                rsn_present = True
+                in_rsn = True
+            elif line.startswith("WPA:"):
+                wpa_present = True
+                in_rsn = False
+            elif line.startswith("WPS:"):
+                wps = True
+            elif in_rsn and line.startswith("Authentication suites:"):
+                value = line.split(":", 1)[1]
+                for akm in ("SAE", "OWE", "PSK", "802.1X"):
+                    if akm in value and akm not in akms:
+                        akms.append(akm)
+            elif in_rsn and line.startswith("Capabilities:"):
+                match = re.search(r"0x([0-9a-fA-F]+)", line)
+                if match:
+                    capabilities = int(match.group(1), 16)
+
+        hidden = not ssid
+        if hidden and not include_hidden:
+            continue
+
+        channel = channel or channel_from_frequency(frequency)
+        rsn = None
+        wpa = None
+        if rsn_present:
+            rsn = {
+                "akms": akms,
+                "pairwise_ciphers": ["CCMP"],
+                "pmf_required": bool(capabilities & 0x0040),
+                "pmf_capable": bool(capabilities & 0x0080),
+                "pmf": bool(capabilities & 0x00C0),
+            }
+        if wpa_present:
+            wpa = {"akms": ["PSK"], "pairwise_ciphers": ["TKIP"]}
+
+        encryption = classify_security(rsn, wpa, privacy)
+        entry = {
+            "ssid": ssid or "<hidden>",
+            "hidden": hidden,
+            "bssid": bssid,
+            "channel": int(channel or 0),
+            "frequency": frequency,
+            "signal": signal,
+            "encryption": encryption,
+            "pmf": bool(rsn and rsn.get("pmf")),
+            "pmf_required": bool(rsn and rsn.get("pmf_required")),
+            "pmf_capable": bool(rsn and rsn.get("pmf_capable")),
+            "wps": wps,
+            "last_seen": time.time(),
+        }
+
+        existing = networks.get(bssid)
+        if existing is None or signal > existing.get("signal", -100):
+            networks[bssid] = entry
+
+    return sorted(networks.values(), key=lambda net: net.get("signal", -100),
+                  reverse=True)
+
+
+def _parse_netsh_output(output: str, include_hidden: bool) -> List[Dict]:
+    networks: Dict[str, Dict] = {}
+    current: Optional[Dict] = None
+
+    def finish():
+        nonlocal current
+        if current and current.get("bssid"):
+            bssid = current["bssid"].lower()
+            existing = networks.get(bssid)
+            if existing is None or current.get("signal", -100) > existing.get("signal", -100):
+                networks[bssid] = current
+        current = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("SSID") and "BSSID" not in line:
+            finish()
+            ssid = line.split(":", 1)[1].strip() if ":" in line else ""
+            if not ssid and not include_hidden:
+                current = None
+                continue
+            current = {
+                "ssid": ssid or "<hidden>",
+                "hidden": not ssid,
+                "bssid": "",
+                "channel": 0,
+                "frequency": 0,
+                "signal": -100,
+                "encryption": "?",
+                "pmf": False,
+                "pmf_required": False,
+                "pmf_capable": False,
+                "wps": False,
+                "last_seen": time.time(),
+            }
+        elif current is not None and "BSSID" in line:
+            current["bssid"] = line.split(":", 1)[1].strip()
+        elif current is not None and "Channel" in line:
+            try:
+                current["channel"] = int(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif current is not None and "Signal" in line:
+            try:
+                percent = int(line.split(":", 1)[1].strip().replace("%", ""))
+                current["signal"] = -100 + (percent // 2)
+            except (ValueError, IndexError):
+                pass
+        elif current is not None and "Authentication" in line:
+            auth = line.split(":", 1)[1].strip() if ":" in line else ""
+            if "WPA3" in auth or "SAE" in auth:
+                current["encryption"] = "WPA3"
+            elif "WPA2" in auth:
+                current["encryption"] = "WPA2"
+            elif "WPA" in auth:
+                current["encryption"] = "WPA"
+            elif "Open" in auth:
+                current["encryption"] = "OPEN"
+
+    finish()
+    return sorted(networks.values(), key=lambda net: net.get("signal", -100),
+                  reverse=True)
+
+
+def scan_networks_system(interface: str, scan_time: float = 10,
+                         verbose: bool = False,
+                         include_hidden: bool = True) -> List[Dict]:
+    """Fallback scanner using ``iw`` (Linux) or ``netsh`` (Windows)."""
     if sys.platform.startswith("linux"):
         try:
-            # Trigger scan
-            subprocess.run(
-                ["iw", "dev", interface, "scan", "-u"],
-                capture_output=True, timeout=scan_time + 5
-            )
-
-            # Parse scan results
-            result = subprocess.run(
-                ["iw", "dev", interface, "scan"],
-                capture_output=True, text=True, timeout=10
-            )
-
-            current = {}
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-
-                if line.startswith("BSS "):
-                    if current and "ssid" in current:
-                        networks.append(current)
-                    bssid = line.split()[1].strip("()")
-                    current = {"bssid": bssid, "ssid": "", "channel": 0,
-                               "signal": -100, "encryption": "?", "pmf": False}
-
-                elif "SSID:" in line and current:
-                    parts = line.split("SSID:", 1)
-                    if len(parts) == 2:
-                        current["ssid"] = parts[1].strip()
-
-                elif "freq:" in line and current:
-                    parts = line.split("freq:", 1)
-                    if len(parts) == 2:
-                        freq = int(parts[1].strip())
-                        # Convert frequency to channel
-                        if 2412 <= freq <= 2484:
-                            current["channel"] = (freq - 2412) // 5 + 1
-                        elif 5180 <= freq <= 5825:
-                            current["channel"] = (freq - 5180) // 5 + 36
-
-                elif "signal:" in line and current:
-                    parts = line.split("signal:", 1)
-                    if len(parts) == 2:
-                        try:
-                            current["signal"] = int(float(parts[1].strip().split()[0]))
-                        except (ValueError, IndexError):
-                            pass
-
-                elif "RSN:" in line or "WPA:" in line:
-                    if current:
-                        current["encryption"] = "WPA2" if "RSN" in line else "WPA"
-
-                elif "* Authentication suites:" in line and current:
-                    if "SAE" in line:
-                        current["encryption"] = "WPA3"
-
-                # PMF detection via RSN capabilities
-                elif "Capabilities:" in line and current and "0x" in line:
-                    try:
-                        cap_str = line.split("Capabilities:")[1].strip()
-                        cap_val = int(cap_str, 16)
-                        # 0x40 = MFP Required, 0x20 = MFP Capable
-                        current["pmf"] = bool(cap_val & 0x60)
-                    except (ValueError, IndexError):
-                        pass
-
-            if current and "ssid" in current:
-                networks.append(current)
-
+            subprocess.run(["iw", "dev", interface, "scan", "-u"],
+                           capture_output=True, timeout=scan_time + 5)
+            result = subprocess.run(["iw", "dev", interface, "scan"],
+                                    capture_output=True, text=True, timeout=15)
         except FileNotFoundError:
             print("[!] iw command not found. Install iw with: apt install iw")
+            return []
         except subprocess.TimeoutExpired:
             print("[!] Scan timed out.")
+            return []
 
-    elif sys.platform == "win32":
+        if result.returncode != 0:
+            message = result.stderr.strip() or "iw scan failed"
+            print(f"[!] {message}")
+            if "monitor" in message.lower() or "busy" in message.lower():
+                print("    Tip: run without --no-monitor, or use managed mode.")
+            return []
+
+        networks = _parse_iw_scan_output(result.stdout, include_hidden)
+        if verbose:
+            print(f"[VERBOSE] iw scan found {len(networks)} networks.")
+        return networks
+
+    if sys.platform == "win32":
         try:
             result = subprocess.run(
                 ["netsh", "wlan", "show", "networks", "mode=Bssid"],
-                capture_output=True, text=True, timeout=15
-            )
-            current = {}
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-
-                if line.startswith("SSID"):
-                    if current and "ssid" in current:
-                        networks.append(current)
-                    current = {"ssid": line.split(":", 1)[1].strip() if ":" in line else "",
-                               "bssid": "", "channel": 0, "signal": -100,
-                               "encryption": "?", "pmf": False}
-
-                elif "BSSID" in line and current:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        current["bssid"] = parts[1].strip()
-
-                elif "Channel" in line and current:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        try:
-                            current["channel"] = int(parts[1].strip())
-                        except ValueError:
-                            pass
-
-                elif "Signal" in line and current:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        sig_str = parts[1].strip().replace("%", "")
-                        try:
-                            sig_pct = int(sig_str)
-                            # Convert percentage to approximate dBm
-                            current["signal"] = -100 + (sig_pct // 2)
-                        except ValueError:
-                            pass
-
-                elif "Authentication" in line and current:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        auth = parts[1].strip()
-                        if "WPA3" in auth or "SAE" in auth:
-                            current["encryption"] = "WPA3"
-                        elif "WPA2" in auth:
-                            current["encryption"] = "WPA2"
-                        elif "WPA" in auth:
-                            current["encryption"] = "WPA"
-                        elif "Open" in auth:
-                            current["encryption"] = "OPEN"
-
-            if current and "ssid" in current:
-                networks.append(current)
-
+                capture_output=True, text=True, timeout=15)
         except FileNotFoundError:
             print("[!] netsh not found.")
+            return []
         except subprocess.TimeoutExpired:
             print("[!] netsh scan timed out.")
+            return []
+        networks = _parse_netsh_output(result.stdout, include_hidden)
+        if verbose:
+            print(f"[VERBOSE] netsh scan found {len(networks)} networks.")
+        return networks
 
-    # Sort by signal
-    networks.sort(key=lambda n: n.get("signal", -100), reverse=True)
-    return networks
+    print(f"[!] System-command scanning is not supported on {sys.platform}.")
+    return []
